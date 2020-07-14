@@ -1,0 +1,471 @@
+import torch
+import torch.nn as nn
+from torchvision.models.resnet import Bottleneck
+from model.SharedBackbone import ResNetBackbone
+from model.Res5Block import Res5Block
+from utils import *
+import torch.nn.functional as F
+from math import sqrt
+import math
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+class AulixiaryConvolutions(nn.Module):
+    """
+    Additional convolutions to produce higher-level feature maps(res5, res7, and pool feature maps).
+    """
+    def __init__(self, block=Bottleneck, layers=[2,2]):
+        """
+
+        :param block: to create another residual blocks.
+        :param layers: assign how many layers in each residual blocks.
+        :param num_classes:
+        :param zero_init_residual:
+        :param groups:
+        :param width_per_group:
+        :param replace_stride_with_dilation:
+        :param norm_layer:
+        """
+        super(AulixiaryConvolutions, self).__init__()
+
+        self.inplanes = 2048
+        self.dilation = 1
+
+        self.layer6 = self._make_layer(block,256,layers[0],stride=2)
+        self.layer7 = self._make_layer(block, 256, layers[1], stride=2)
+        self.avgpool = nn.AvgPool2d(kernel_size=3, stride=1, padding=0)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def forward(self, res5_ssd_feats):
+        out = self.layer6(res5_ssd_feats)
+        res6_feats = out    # 1024 channel, 1/64
+
+        out = self.layer7(out)
+        res7_feats = out    # 1024 channel, 1/128
+
+        out = self.avgpool(out)
+        pool_feats = out    # 1024 channel, 1/256
+
+        return res6_feats, res7_feats, pool_feats
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+class PredictionConvolutions(nn.Module):
+    """
+    Convolutions to predict class scores and bounding boxes using lower and higher-level feature maps.
+
+    The bounding boxes(locations) are predicted as encoded offsets w.r.t each of the 8732 prior (default) boxes.
+    See 'cxcy_to_gcxgcy' in utils.py for the encoding definition.
+
+    The class scores represent the scores of each object class in each of the 8732 bounding boxes located.
+    A high score for 'background' = no object.
+    """
+
+    def __init__(self, n_classes):
+        """
+        :param n_classes: number of different types of object.
+        """
+        super(PredictionConvolutions, self).__init__()
+
+        self.n_classes = n_classes
+
+        # Number of prior-boxes we are considering per position in each feature map
+        n_boxes = {
+            'res3': 4,
+            'res4': 6,
+            'res5_ssd': 6,
+            'res6': 6,
+            'res7': 4,
+            'pool': 4
+        }
+        # 4 prior boxes implies we use 4 different aspect ratios, etc
+
+        # Localization prediction convolutions (predict offsets w.r.t prior-boxes)
+        self.loc_res3 = nn.Conv2d(512, n_boxes['res3']*4, kernel_size=3, padding=1)
+        self.loc_res4 = nn.Conv2d(1024, n_boxes['res4']*4, kernel_size=3, padding=1)
+        self.loc_res5_ssd = nn.Conv2d(2048, n_boxes['res5_ssd']*4, kernel_size=3, padding=1)
+        self.loc_res6 = nn.Conv2d(1024, n_boxes['res6']*4, kernel_size=3, padding=1)
+        self.loc_res7 = nn.Conv2d(1024, n_boxes['res7']*4, kernel_size=3, padding=1)
+        self.loc_pool = nn.Conv2d(1024, n_boxes['pool']*4, kernel_size=3, padding=1)
+
+        # Class prediction convolutions (predict classes in localization boxes)
+        self.cl_res3 = nn.Conv2d(512, n_boxes['res3'] * n_classes, kernel_size=3, padding=1)
+        self.cl_res4 = nn.Conv2d(1024, n_boxes['res4'] * n_classes, kernel_size=3, padding=1)
+        self.cl_res5_ssd = nn.Conv2d(2048, n_boxes['res5_ssd'] * n_classes, kernel_size=3, padding=1)
+        self.cl_res6 = nn.Conv2d(1024, n_boxes['res6'] * n_classes, kernel_size=3, padding=1)
+        self.cl_res7 = nn.Conv2d(1024, n_boxes['res7'] * n_classes, kernel_size=3, padding=1)
+        self.cl_pool = nn.Conv2d(1024, n_boxes['pool'] * n_classes, kernel_size=3, padding=1)
+
+        self.init_conv2d()
+
+    def init_conv2d(self):
+        """
+        Initialize convolution parameters
+        """
+        for c in self.children():
+            if isinstance(c, nn.Conv2d):
+                nn.init.xavier_uniform_(c.weight)
+                nn.init.constant_(c.bias, 0.)
+
+    def forward(self, res3_feats, res4_feats, res5_ssd_feats, res6_feats, res7_feats, pool_feats):
+        """
+        Forward propagation.
+
+        :param res3_feats:  (B, 512, 38,38)
+        :param res4_feats: (B, 1024, 19,19)
+        :param res5_ssd_feats: (B, 2048, 10,10)
+        :param res6_feats: (B, 1024, 5,5)
+        :param res7_feats: (B, 1024, 3,3)
+        :param pool_feats: (B, 1024, 1,1)
+        :return: 8732 locations and class scores (i.e. w.r.t each prior box) for each image
+        """
+        batch_size = res3_feats.size(0)
+
+        # Predict localization boxes' bounds (as offsets w.r.t prior-boxes)
+        l_res3 = self.loc_res3(res3_feats)  # (B, 16, 38, 38)
+        l_res3 = l_res3.permute(0, 2, 3,
+                                1).contiguous()    # (B, 38, 38, 16), to match prior-box order (after .view())
+        # (.contiguous() ensures it is stored in a contiguous chunk of memory, needed for .view() below)
+        l_res3 = l_res3.view(batch_size, -1, 4) # (B, 5776, 4), there are a total 5776 boxes on this feature map
+
+        l_res4 = self.loc_res4(res4_feats)  # (B, 24, 19, 19)
+        l_res4 = l_res4.permute(0, 2, 3, 1).contiguous()    # (B, 19, 19, 24)
+        l_res4 = l_res4.view(batch_size, -1, 4) # (B, 2166, 4)
+
+        l_res5 = self.loc_res5_ssd(res5_ssd_feats)
+        l_res5 = l_res5.permute(0, 2, 3, 1).contiguous()    # (B, 10, 10, 24)
+        l_res5 = l_res5.view(batch_size, -1, 4) # (B, 600, 4)
+
+        l_res6 = self.loc_res6(res6_feats)
+        l_res6 = l_res6.permute(0, 2, 3, 1).contiguous()    # (B, 5, 5, 24)
+        l_res6 = l_res6.view(batch_size, -1, 4) # (B, 150, 4)
+
+        l_res7 = self.loc_res7(res7_feats)
+        l_res7 = l_res7.permute(0, 2, 3, 1).contiguous()    # (B, 3, 3, 16)
+        l_res7 = l_res7.view(batch_size, -1, 4) # (B, 36, 4)
+
+        l_pool = self.loc_pool(pool_feats)
+        l_pool = l_pool.permute(0, 2, 3, 1).contiguous()    # (B, 1, 1, 16)
+        l_pool = l_pool.view(batch_size, -1, 4) # (B, 4, 4)
+
+        # Predict classes in localization boxes
+        c_res3 = self.cl_res3(res3_feats)   # (B, 4*n_classes, 38, 38)
+        c_res3 = c_res3.permute(0, 2, 3,
+                                1).contiguous()    # (B, 38, 38, 4 * n_classes), to match prior-box order (after .view())
+        c_res3 = c_res3.view(batch_size, -1,
+                             self.n_classes)    # (B, 5776, n_classes), there are a total 5776 boxes on this feature map.
+
+        c_res4 = self.cl_res4(res4_feats) # (B, 4 * n_classes, 19, 19)
+        c_res4 = c_res4.permute(0, 2, 3, 1).contiguous()    # (B, 19, 19, 4 * n_classes)
+        c_res4 = c_res4.view(batch_size, -1, self.n_classes)    # (B, 2166, n_classes)
+
+        c_res5 = self.cl_res5_ssd(res5_ssd_feats)
+        c_res5 = c_res5.permute(0, 2, 3, 1).contiguous()    # (B, 10, 10, 4 * n_classes)
+        c_res5 = c_res5.view(batch_size, -1, self.n_classes)    # (B, 600, n_classes)
+
+        c_res6 = self.cl_res6(res6_feats)
+        c_res6 = c_res6.permute(0, 2, 3, 1).contiguous()
+        c_res6 = c_res6.view(batch_size, -1, self.n_classes) # (B, 150, n_classes)
+
+        c_res7 = self.cl_res7(res7_feats)
+        c_res7 = c_res7.permute(0, 2, 3, 1).contiguous()
+        c_res7 = c_res7.view(batch_size, -1, self.n_classes) # (B, 36, n_classes)
+
+        c_pool = self.cl_pool(pool_feats)
+        c_pool = c_pool.permute(0, 2, 3, 1).contiguous()
+        c_pool = c_pool.view(batch_size, -1, self.n_classes)# (B, 4, n_classes)
+
+        # A total of 8732 boxes
+        # Concatenate in this specific order (i.e. must match the order of the prior-boxes)
+        locs = torch.cat([l_res3, l_res4, l_res5, l_res6, l_res7, l_pool], dim=1) # (N, 8732, 4)
+        classes_scores = torch.cat([c_res3, c_res4, c_res5, c_res6, c_res7, c_pool], dim=1) # (N, 8732, n_classes)
+
+        return locs, classes_scores
+
+
+class FcnPredictionConvolutions(nn.Module):
+    def __init__(self, classes):
+        super(FcnPredictionConvolutions, self).__init__()
+        self.fcn_classes = classes
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv1 = nn.Conv2d(1024, self.fcn_classes, kernel_size=1)
+        self.bn1 = nn.BatchNorm2d(self.fcn_classes)
+
+        self.conv2 = nn.Conv2d(2048, self.fcn_classes, kernel_size=1)
+        self.bn2 = nn.BatchNorm2d(self.fcn_classes)
+        #
+        # self.upsample_1p9x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, kernel_size=3,
+        #                                         stride=2, padding=1)
+        # self.upsample_1p9x.weight.data = get_upsampling_weight(self.fcn_classes, self.fcn_classes, 3)
+
+        self.upsample_2x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, 3, 2, 1, False)
+        self.upsample_2x.weight.data = get_upsampling_weight(self.fcn_classes, self.fcn_classes, 3)
+
+        # self.upsample_4x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, 8, 4, 2, False)
+        # self.upsample_4x.weight.data = get_upsampling_weight(self.fcn_classes, self.fcn_classes, 8)
+
+        # self.upsample_16x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, 32, 16, 8, False)
+
+        # self.upsample_15p7x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, 28, 16, 8, False)
+        # self.upsample_15p7x.weight.data = get_upsampling_weight(self.fcn_classes, self.fcn_classes, 28)
+
+        self.upsample_16x = nn.ConvTranspose2d(self.fcn_classes, self.fcn_classes, 28, 16, 8, False)
+        self.upsample_16x.weight.data = get_upsampling_weight(self.fcn_classes, self.fcn_classes, 28)
+
+    def forward(self, res4_feats, res5_feats):
+
+        res4 = self.relu(self.bn1(self.conv1(res4_feats)))  # 1/16
+
+        res5 = self.relu(self.bn2(self.conv2(res5_feats)))  # 1/32
+
+        upsampled_res5 = self.upsample_2x(res5)  # 1/16
+
+        seg_scores = self.upsample_16x(res4 + upsampled_res5)
+
+        return seg_scores
+
+class MtlModel(nn.Module):
+    def __init__(self, fcn_classes, ssd_classes):
+        super(MtlModel, self).__init__()
+
+        self.fcn_classes = fcn_classes
+        self.ssd_classes = ssd_classes
+
+        self.shared_backbone = ResNetBackbone()
+
+        self.fcn_res5_block = Res5Block()
+        self.fcn_pre_convs = FcnPredictionConvolutions(classes=fcn_classes)
+
+        self.ssd_res5_block = Res5Block()
+        self.ssd_aux_convs = AulixiaryConvolutions()
+        self.ssd_pre_convs = PredictionConvolutions(n_classes=ssd_classes)
+
+        self.priors_cxcy = self.create_prior_boxes()
+
+    def forward(self, image):
+
+        common_res3_feats, common_res4_feats = self.shared_backbone(image)
+
+        # Semantic Segmentation
+        fcn_res5_feats = self.fcn_res5_block(common_res4_feats)
+        seg_scores = self.fcn_pre_convs(common_res4_feats, fcn_res5_feats)
+
+        ssd_res5_feats = self.ssd_res5_block(common_res4_feats)
+        ssd_res6_feats, ssd_res7_feats, ssd_pool_feats = self.ssd_aux_convs(ssd_res5_feats)
+        locs, class_scores = self.ssd_pre_convs(common_res3_feats, common_res4_feats, ssd_res5_feats,
+                                          ssd_res6_feats, ssd_res7_feats, ssd_pool_feats)
+
+        return seg_scores, locs, class_scores
+
+    def create_prior_boxes(self):
+        """
+        Create the 8732 prior boxes for the SSD300, as defined in the paper.
+        :return: prior boxes in center-size coordinates, a tensor of dimensions (8732, 4)
+        """
+        fmap_dims = {
+            'res3': 38,
+            'res4': 19,
+            'res5': 10,
+            'res6': 5,
+            'res7': 3,
+            'pool': 1
+        }
+
+
+        obj_scales = {
+            'res3': 0.05,
+            'res4': 0.15,
+            'res5': 0.25,
+            'res6': 0.36,
+            'res7': 0.45,
+            'pool': 0.5
+        }
+        # obj_scales = {
+        #     'res3': 0.1,
+        #     'res4': 0.2,
+        #     'res5': 0.375,
+        #     'res6': 0.55,
+        #     'res7': 0.725,
+        #     'pool': 0.9
+        # }
+
+        aspect_ratios = {
+            'res3': [1., 2., 0.5],
+            'res4': [1., 2., 3., 0.5, .333],
+            'res5': [1., 2., 3., 0.5, .333],
+            'res6': [1., 2., 3., 0.5, .333],
+            'res7': [1., 2., 0.3],
+            'pool': [1., 2., 0.5]
+        }
+        fmaps = list(fmap_dims.keys())
+
+        prior_boxes = []
+
+        for k, fmap in enumerate(fmaps):    # 0 - 5; 'res3' -- 'pool'
+            for i in range(fmap_dims[fmap]):    # 0 - 38、19...1
+                for j in range(fmap_dims[fmap]):    # 0 - 38、19...1
+                    cx = (j + 0.5) / fmap_dims[fmap]
+                    cy = (i + 0.5) / fmap_dims[fmap]
+
+                    for ratio in aspect_ratios[fmap]:
+                        prior_boxes.append([cx, cy, obj_scales[fmap] * sqrt(ratio), obj_scales[fmap] / sqrt(ratio)])
+
+                        # For an aspect ratio of 1, use an additional prior whose scale is the geometric mean of the
+                        # scale of the current feature map and the scale of the next feature map
+                        if ratio == 1.:
+                            try:
+                                additional_scale = sqrt(obj_scales[fmap] * obj_scales[fmaps[k + 1]])
+                            # For the last feature map, there is no "next" feature map
+                            except IndexError:
+                                additional_scale = 1.
+                            prior_boxes.append([cx, cy, additional_scale, additional_scale])
+
+        prior_boxes = torch.FloatTensor(prior_boxes).to(device)
+        prior_boxes.clamp_(0, 1) # (8732, 4)
+
+        return prior_boxes
+
+    def detect_objects(self, predicted_locs, predicted_scores, min_score, max_overlap, top_k):
+        """
+        Decipher the 8732 locations and class scores (output of this SSD300) to detect objects.
+
+        for each class, perform Non-Maximum Suppression (NMS) on boxes that are above a minimum threshold.
+
+        :param predicted_locs: predicted locations/boxes w.r.t the 8732 prior boxes, a tensor of dimensions (N, 8732, 4)
+        :param predicted_scores: class scores for each of the encoded locations/boxes, a tensor of dimension (N, 8732, 4)
+        :param min_score: minimum threshold for a box to be considered a match for a certain class
+        :param max_overlap: maximum overlap two boxes can have so that the one with the lower score is not suppressed via NMS
+        :param top_k: if there are a lot of resulting detection across all classes, keep only the top 'k'
+        :return: detections (boxes, labels, and scores), lists of length batch size.
+        """
+        batch_size = predicted_locs.size(0) # N
+        n_priors = self.priors_cxcy.size(0) # 8732
+        predicted_scores = F.softmax(predicted_scores, dim=2) # (N, 8732, n_classes)
+
+        # Lists to store final predicted boxes, labels, and scores for all images
+        all_images_boxes = list()
+        all_images_labels = list()
+        all_images_scores = list()
+
+        assert n_priors == predicted_locs.size(1) == predicted_scores.size(1)
+
+        for i in range(batch_size):
+            # Decode object coordinates from the form we regressed predicted boxes to
+            decoded_locs = cxcy_to_xy(
+                gcxgcy_to_cxcy(predicted_locs[i], self.priors_cxcy)) # (8732, 4), these are fractional pt. coordinates
+
+            # Lists to store boxes and scores for this image
+            image_boxes = list()
+            image_labels = list()
+            image_scores = list()
+
+            max_scores, best_label = predicted_scores[i].max(dim=1) # (8732)
+
+            self.n_classes = self.ssd_classes # mark for modified
+
+            # Check for each class
+            for c in range(1, self.n_classes):
+                # Keep only predicted boxes and scores where scores for this class are above the minimum score
+                class_scores = predicted_scores[i][:, c]  # (8732)
+                score_above_min_score = class_scores > min_score  # torch.uint8 (byte) tensor, for indexing
+                n_above_min_score = score_above_min_score.sum().item()
+                if n_above_min_score == 0:
+                    continue
+                class_scores = class_scores[score_above_min_score]  # (n_qualified), n_min_score <= 8732
+                class_decoded_locs = decoded_locs[score_above_min_score]  # (n_qualified, 4)
+
+                # Sort predicted boxes and scores by scores
+                class_scores, sort_ind = class_scores.sort(dim=0, descending=True)  # (n_qualified), (n_min_score)
+                class_decoded_locs = class_decoded_locs[sort_ind]  # (n_min_score, 4)
+
+                # Find the overlap between predicted boxes
+                overlap = find_jaccard_overlap(class_decoded_locs, class_decoded_locs)  # (n_qualified, n_min_score)
+
+                # Non-Maximum Suppression (NMS)
+
+                # A torch.uint8 (byte) tensor to keep track of which predicted boxes to suppress
+                # 1 implies suppress, 0 implies don't suppress
+                # suppress = torch.zeros((n_above_min_score), dtype=torch.uint8).to(device)  # (n_qualified)
+                suppress = torch.zeros((n_above_min_score)).bool().to(device)
+
+                # Consider each box in order of decreasing scores
+                for box in range(class_decoded_locs.size(0)):
+                    # If this box is already marked for suppression
+                    if suppress[box] == 1:
+                        continue
+
+                    # Suppress boxes whose overlaps (with this box) are greater than maximum overlap
+                    # Find such boxes and update suppress indices
+                    # suppress = torch.max(suppress, overlap[box] > max_overlap)
+                    suppress = suppress | (overlap[box] > max_overlap)
+                    # The max operation retains previously suppressed boxes, like an 'OR' operation
+
+                    # Don't suppress this box, even though it has an overlap of 1 with itself
+                    suppress[box] = 0
+
+                # Store only unsuppressed boxes for this class
+                image_boxes.append(class_decoded_locs[~suppress])
+                image_labels.append(torch.LongTensor((~suppress).sum().item() * [c]).to(device))
+                image_scores.append(class_scores[~suppress])
+
+            # If no object in any class is found, store a placeholder for 'background'
+            if len(image_boxes) == 0:
+                image_boxes.append(torch.FloatTensor([[0., 0., 1., 1.]]).to(device))
+                image_labels.append(torch.LongTensor([0]).to(device))
+                image_scores.append(torch.FloatTensor([0.]).to(device))
+
+            # Concatenate into single tensors
+            image_boxes = torch.cat(image_boxes, dim=0)  # (n_objects, 4)
+            image_labels = torch.cat(image_labels, dim=0)  # (n_objects)
+            image_scores = torch.cat(image_scores, dim=0)  # (n_objects)
+            n_objects = image_scores.size(0)
+
+            # Keep only the top k objects
+            if n_objects > top_k:
+                image_scores, sort_ind = image_scores.sort(dim=0, descending=True)
+                image_scores = image_scores[:top_k]  # (top_k)
+                image_boxes = image_boxes[sort_ind][:top_k]  # (top_k, 4)
+                image_labels = image_labels[sort_ind][:top_k]  # (top_k)
+
+            # Append to lists that store predicted boxes and scores for all images
+            all_images_boxes.append(image_boxes)
+            all_images_labels.append(image_labels)
+            all_images_scores.append(image_scores)
+
+        return all_images_boxes, all_images_labels, all_images_scores  # lists of length batch_size
+
+if __name__ == '__main__':
+
+    mtlmodel = MtlModel(fcn_classes=6, ssd_classes=7)
+    tensor = torch.randn((3,3,300,300))
+    seg_scores, locs, class_scores = mtlmodel(tensor)
+    print(mtlmodel)
+    print(seg_scores.shape, locs.shape, class_scores.shape)
