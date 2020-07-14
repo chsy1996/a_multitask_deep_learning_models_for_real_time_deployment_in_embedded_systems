@@ -1,0 +1,6 @@
+original edition:
+ pytorch-1.4.0
+ python-3.7.0
+
+change to:
+ python-3.6
